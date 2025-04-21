@@ -1,6 +1,9 @@
-import 'dart:convert';
+// ignore_for_file: use_build_context_synchronously
+
 import 'dart:io';
-import 'dart:typed_data';
+import 'dart:isolate';
+import 'package:archive/archive_io.dart';
+import 'package:daily_you/config_provider.dart';
 import 'package:daily_you/file_bytes_cache.dart';
 import 'package:daily_you/file_layer.dart';
 import 'package:daily_you/models/image.dart';
@@ -8,14 +11,14 @@ import 'package:daily_you/stats_provider.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:daily_you/models/entry.dart';
 import 'package:daily_you/models/template.dart';
-import 'package:image_picker/image_picker.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_gen/gen_l10n/app_localizations.dart';
 import 'package:media_scanner/media_scanner.dart';
 import 'package:schedulers/schedulers.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart';
-
-import 'config_manager.dart';
 
 class EntriesDatabase {
   static final EntriesDatabase instance = EntriesDatabase._init();
@@ -231,16 +234,21 @@ DROP TABLE old_entries;
     return entryImages;
   }
 
-  Future<EntryImage> addImg(EntryImage entryImage) async {
+  Future<EntryImage> addImg(EntryImage entryImage,
+      {updateStatsAndSync = true}) async {
     final db = _database!;
 
     final id = await db.insert(imagesTable, entryImage.toJson());
-    await StatsProvider.instance.updateStats();
-    if (usingExternalDb()) await updateExternalDatabase();
+
+    if (updateStatsAndSync) {
+      await StatsProvider.instance.updateStats();
+      if (usingExternalDb()) await updateExternalDatabase();
+    }
+
     return entryImage.copy(id: id);
   }
 
-  Future<int> removeImg(EntryImage entryImage) async {
+  Future<int> removeImg(EntryImage entryImage, {updateData = true}) async {
     final db = _database!;
 
     // Delete image
@@ -252,8 +260,10 @@ DROP TABLE old_entries;
       where: '${EntryImageFields.id} = ?',
       whereArgs: [entryImage.id],
     );
-    await StatsProvider.instance.updateStats();
-    if (usingExternalDb()) await updateExternalDatabase();
+    if (updateData) {
+      await StatsProvider.instance.updateStats();
+      if (usingExternalDb()) await updateExternalDatabase();
+    }
     return removedId;
   }
 
@@ -347,12 +357,15 @@ DROP TABLE old_entries;
   }
 
   // Entry Methods
-  Future<Entry> create(Entry entry) async {
+  Future<Entry> addEntry(Entry entry, {updateStatsAndSync = true}) async {
     final db = _database!;
 
     final id = await db.insert(entriesTable, entry.toJson());
-    await StatsProvider.instance.updateStats();
-    if (usingExternalDb()) await updateExternalDatabase();
+
+    if (updateStatsAndSync) {
+      await StatsProvider.instance.updateStats();
+      if (usingExternalDb()) await updateExternalDatabase();
+    }
     return entry.copy(id: id);
   }
 
@@ -432,13 +445,18 @@ DROP TABLE old_entries;
     return removedId;
   }
 
-  Future<void> deleteAllEntries() async {
+  Future<void> deleteAllEntries(Function(String) updateStatus) async {
+    updateStatus("0%");
     final entries = await getAllEntries();
+    var processedEntries = 0;
     for (Entry entry in entries) {
       var images = await getImagesForEntry(entry.id!);
       for (final image in images) {
-        await removeImg(image);
+        // Don't update data until everything is deleted
+        await removeImg(image, updateData: false);
       }
+      processedEntries += 1;
+      updateStatus("${((processedEntries / entries.length) * 100).round()}%");
     }
     final db = _database!;
 
@@ -457,11 +475,11 @@ DROP TABLE old_entries;
   }
 
   bool usingExternalDb() {
-    return ConfigManager.instance.getField('useExternalDb') ?? false;
+    return ConfigProvider.instance.get(ConfigKey.useExternalDb) ?? false;
   }
 
   bool usingExternalImg() {
-    return ConfigManager.instance.getField('useExternalImg') ?? false;
+    return ConfigProvider.instance.get(ConfigKey.useExternalImg) ?? false;
   }
 
   Future<String> getInternalImgDatabasePath() async {
@@ -485,7 +503,7 @@ DROP TABLE old_entries;
   }
 
   Future<String> getExternalImgDatabasePath() async {
-    final rootImgPath = ConfigManager.instance.getField('externalImgUri');
+    final rootImgPath = ConfigProvider.instance.get(ConfigKey.externalImgUri);
     return rootImgPath;
   }
 
@@ -505,7 +523,7 @@ DROP TABLE old_entries;
   // Ensure external folders can be accessed if in use
   Future<bool> hasDbUriPermission() async {
     return FileLayer.hasPermission(
-        await ConfigManager.instance.getField('externalDbUri'));
+        await ConfigProvider.instance.get(ConfigKey.externalDbUri));
   }
 
   Future<bool> hasImgUriPermission() async {
@@ -518,11 +536,12 @@ DROP TABLE old_entries;
     if (selectedDirectory == null) return false;
 
     // Save old external path
-    var oldExternalPath = ConfigManager.instance.getField('externalDbUri');
+    var oldExternalPath = ConfigProvider.instance.get(ConfigKey.externalDbUri);
     var oldUseExternalPath = usingExternalDb();
 
-    await ConfigManager.instance.setField('externalDbUri', selectedDirectory);
-    await ConfigManager.instance.setField('useExternalDb', true);
+    await ConfigProvider.instance
+        .set(ConfigKey.externalDbUri, selectedDirectory);
+    await ConfigProvider.instance.set(ConfigKey.useExternalDb, true);
     // Sync with external folder
     var synced = await syncDatabase(forceOverwrite: true);
     if (synced) {
@@ -534,9 +553,10 @@ DROP TABLE old_entries;
       return true;
     } else {
       // Restore state after failure
-      await ConfigManager.instance.setField('externalDbUri', oldExternalPath);
-      await ConfigManager.instance
-          .setField('useExternalDb', oldUseExternalPath);
+      await ConfigProvider.instance
+          .set(ConfigKey.externalDbUri, oldExternalPath);
+      await ConfigProvider.instance
+          .set(ConfigKey.useExternalDb, oldUseExternalPath);
       return false;
     }
   }
@@ -546,14 +566,14 @@ DROP TABLE old_entries;
         useExternalPath: false);
     if (bytes == null) return false;
     return await FileLayer.writeFileBytes(
-        ConfigManager.instance.getField('externalDbUri'), bytes,
+        ConfigProvider.instance.get(ConfigKey.externalDbUri), bytes,
         name: "daily_you.db");
   }
 
   Future<bool> syncDatabase({bool forceOverwrite = false}) async {
     // Check if external database exists
     var externalExists = await FileLayer.exists(
-        ConfigManager.instance.getField('externalDbUri'),
+        ConfigProvider.instance.get(ConfigKey.externalDbUri),
         name: "daily_you.db");
 
     if (!externalExists) {
@@ -563,13 +583,13 @@ DROP TABLE old_entries;
 
       // Export internal DB
       var externalDbPath = await FileLayer.createFile(
-          ConfigManager.instance.getField('externalDbUri'),
+          ConfigProvider.instance.get(ConfigKey.externalDbUri),
           "daily_you.db",
           bytes);
       return externalDbPath != null;
     } else if (forceOverwrite || await isExternalDbNewer()) {
       var externalBytes = await FileLayer.getFileBytes(
-          ConfigManager.instance.getField('externalDbUri'),
+          ConfigProvider.instance.get(ConfigKey.externalDbUri),
           name: "daily_you.db");
       if (externalBytes == null) return false;
 
@@ -589,7 +609,7 @@ DROP TABLE old_entries;
         DateTime.now();
 
     var externalModifiedTime = await FileLayer.getFileModifiedTime(
-            ConfigManager.instance.getField('externalDbUri'),
+            ConfigProvider.instance.get(ConfigKey.externalDbUri),
             name: "daily_you.db") ??
         internalModifiedTime;
 
@@ -645,18 +665,21 @@ DROP TABLE old_entries;
     }
 
     if (garbageCollect) {
-      return await garbageCollectImages(entryImages);
+      return await garbageCollectImages();
     }
     return true;
   }
 
-  Future<bool> garbageCollectImages(List<String> entryImages) async {
+  Future<bool> garbageCollectImages() async {
+    var entryImages = await getAllEntryImages();
+    var entryImageNames =
+        entryImages.map((entryImage) => entryImage.imgPath).toList();
     // Get all internal photos
     var internalImages = Directory(await getInternalImgDatabasePath()).list();
     await for (FileSystemEntity fileEntity in internalImages) {
       if (fileEntity is File) {
         // Delete any that aren't used
-        if (!entryImages.contains(basename(fileEntity.path))) {
+        if (!entryImageNames.contains(basename(fileEntity.path))) {
           await File(fileEntity.path).delete();
         }
       }
@@ -666,7 +689,7 @@ DROP TABLE old_entries;
 
   void resetDatabaseLocation() async {
     await _database!.close();
-    await ConfigManager.instance.setField('useExternalDb', false);
+    await ConfigProvider.instance.set(ConfigKey.useExternalDb, false);
     await initDB();
     await StatsProvider.instance.updateStats();
   }
@@ -676,26 +699,28 @@ DROP TABLE old_entries;
     if (selectedDirectory == null) return false;
 
     // Save Old Settings
-    var oldExternalImgUri = ConfigManager.instance.getField('externalImgUri');
+    var oldExternalImgUri =
+        ConfigProvider.instance.get(ConfigKey.externalImgUri);
     var oldUseExternalImg = usingExternalImg();
 
-    await ConfigManager.instance.setField('externalImgUri', selectedDirectory);
-    await ConfigManager.instance.setField('useExternalImg', true);
+    await ConfigProvider.instance
+        .set(ConfigKey.externalImgUri, selectedDirectory);
+    await ConfigProvider.instance.set(ConfigKey.useExternalImg, true);
     var synced = await syncImageFolder(true);
     if (synced) {
       return true;
     } else {
       // Restore Settings
-      await ConfigManager.instance
-          .setField('externalImgUri', oldExternalImgUri);
-      await ConfigManager.instance
-          .setField('useExternalImg', oldUseExternalImg);
+      await ConfigProvider.instance
+          .set(ConfigKey.externalImgUri, oldExternalImgUri);
+      await ConfigProvider.instance
+          .set(ConfigKey.useExternalImg, oldUseExternalImg);
       return false;
     }
   }
 
   void resetImageFolderLocation() async {
-    await ConfigManager.instance.setField('useExternalImg', false);
+    await ConfigProvider.instance.set(ConfigKey.useExternalImg, false);
   }
 
   Future<String> getFilePath() async {
@@ -711,213 +736,205 @@ DROP TABLE old_entries;
     return '';
   }
 
-  Future<bool> importFromOneShot() async {
-    StatsProvider.instance.updateSyncStats(0, 0);
-    var selectedFile = await FileLayer.pickFile();
-    if (selectedFile == null) return false;
-    var bytes = await FileLayer.getFileBytes(selectedFile);
-    if (bytes == null) return false;
-    final jsonData = json.decode(utf8.decode(bytes.toList()));
-
-    final happinessMapping = {
-      "VERY_SAD": -2,
-      "SAD": -1,
-      "NEUTRAL": 0,
-      "HAPPY": 1,
-      "VERY_HAPPY": 2,
-    };
-
-    final db = _database!;
-
-    for (var entry in jsonData) {
-      final createdTimestamp = entry['created'];
-      final createdDateTime =
-          DateTime.fromMillisecondsSinceEpoch(createdTimestamp * 1000)
-              .toIso8601String();
-      final modifiedDateTime = DateTime.now().toUtc().toIso8601String();
-
-      final happinessText = entry['happiness'];
-      final mood = happinessMapping[happinessText];
-
-      // Skip if the day already has an entry
-      if (await getEntryForDate(DateTime.parse(createdDateTime)) == null) {
-        await db.insert('entries', {
-          'text': entry['textContent'],
-          'img_path': entry['relativePath'],
-          'mood': mood,
-          'time_create': createdDateTime,
-          'time_modified': modifiedDateTime,
-        });
-      }
-    }
-    if (usingExternalImg()) await syncImageFolder(true);
-    StatsProvider.instance.updateStats();
-    return true;
-  }
-
-  Future<bool> exportImages() async {
-    List<Entry> entries = await getAllEntries();
-
-    String? saveDir = await FileLayer.pickDirectory();
-    if (saveDir == null) return false;
-
-    List<String> externalImages =
-        await FileLayer.listFiles(saveDir, useExternalPath: true);
-
-    for (Entry entry in entries) {
-      var images = await getImagesForEntry(entry.id!);
-      for (final image in images) {
-        if (externalImages.contains(image.imgPath)) continue;
-        var bytes = await getImgBytes(image.imgPath);
-        if (bytes == null) continue;
-        var newImageName =
-            await FileLayer.createFile(saveDir, image.imgPath, bytes);
-        if (newImageName == null) return false;
-        if (Platform.isAndroid) {
-          // Add image to media store
-          MediaScanner.loadMedia(path: newImageName);
-        }
-      }
-    }
-
-    return true;
-  }
-
-  Future<bool> importImages() async {
-    StatsProvider.instance.updateSyncStats(0, 0);
-    final picker = ImagePicker();
-    final pickedFiles = await picker.pickMultiImage(
-        imageQuality: ConfigManager.instance.getField('imageQuality'));
-
-    List<String> externalImages = List.empty(growable: true);
-    if (usingExternalImg()) {
-      externalImages.addAll(await FileLayer.listFiles(
-          await getExternalImgDatabasePath(),
-          useExternalPath: true));
-    }
-    List<String> internalImages = await FileLayer.listFiles(
-        await getInternalImgDatabasePath(),
-        useExternalPath: false);
-
-    int imported = 0;
-    for (XFile file in pickedFiles) {
-      if (!internalImages.contains(file.name)) {
-        var imageFilePath = await FileLayer.createFile(
-            await getInternalImgDatabasePath(),
-            file.name,
-            await file.readAsBytes(),
-            useExternalPath: false);
-        if (usingExternalImg() && !externalImages.contains(file.name)) {
-          await FileLayer.createFile(await getExternalImgDatabasePath(),
-              file.name, await file.readAsBytes(),
-              useExternalPath: true);
-        }
-        if (imageFilePath == null) return false;
-        if (Platform.isAndroid) {
-          // Add image to media store
-          MediaScanner.loadMedia(path: imageFilePath);
-          await File(file.path).delete();
-        }
-      }
-
-      imported += 1;
-      StatsProvider.instance.updateSyncStats(pickedFiles.length, imported);
-    }
-    StatsProvider.instance.updateStats();
-    return true;
-  }
-
-  Future<bool> exportToJson() async {
+  Future<bool> backupToZip(
+      BuildContext context, void Function(String) updateStatus) async {
     String? savePath = await FileLayer.pickDirectory();
     if (savePath == null) return false;
 
-    final db = _database!;
+    var tempDir = await getTemporaryDirectory();
 
-    final List<Map<String, dynamic>> entries = await db.query('entries');
+    final exportedZipName =
+        "daily_you_backup_${DateTime.now().toIso8601String().replaceAll(':', '-')}.zip";
 
-    List<Map<String, dynamic>> jsonList = [];
+    // Create archive
+    updateStatus(AppLocalizations.of(context)!.creatingBackupStatus("0"));
+    var rxPort = ReceivePort();
 
-    for (var entry in entries) {
-      // Query to get images for the current entry
-      List<Map<String, dynamic>> images = await db.query(
-        imagesTable,
-        where: '${EntryImageFields.entryId} = ?',
-        whereArgs: [entry[EntryFields.id]],
-      );
+    rxPort.listen((data) {
+      var percent = data as double;
+      updateStatus(AppLocalizations.of(context)!
+          .creatingBackupStatus("${percent.round()}"));
+    });
 
-      // Convert images to a list of maps
-      List<Map<String, dynamic>> imageList = images
-          .map((img) => {
-                'imgPath': img[EntryImageFields.imgPath],
-                'imgRank': img[EntryImageFields.imgRank],
-                'timeCreated': img[EntryImageFields.timeCreate],
-              })
-          .toList();
+    await compute(
+      encodeArchive,
+      [
+        join(tempDir.path, exportedZipName),
+        await getInternalDbPath(),
+        await getInternalImgDatabasePath(),
+        rxPort.sendPort
+      ],
+    );
 
-      // Structure the entry
-      Map<String, dynamic> jsonEntry = {
-        'timeCreated': entry[EntryFields.timeCreate],
-        'timeModified': entry[EntryFields.timeModified],
-        'images': imageList,
-        'mood': entry[EntryFields.mood],
-        'text': entry[EntryFields.text] ?? '',
-      };
+    rxPort.close();
 
-      jsonList.add(jsonEntry);
+    // Save archive
+    updateStatus(AppLocalizations.of(context)!.tranferStatus("0"));
+
+    final archiveSize = await FileLayer.getFileSize(tempDir.path,
+        name: exportedZipName, useExternalPath: false);
+    if (archiveSize == null || archiveSize == 0) return false;
+
+    var readStream = await FileLayer.readFileStream(tempDir.path,
+        name: exportedZipName, useExternalPath: false);
+    if (readStream == null) return false;
+    var writeStream =
+        await FileLayer.openFileWriteStream(savePath, exportedZipName);
+    if (writeStream == null) return false;
+
+    var transferredSize = 0;
+
+    await for (List<int> chunk in readStream) {
+      await FileLayer.writeFileWriteStreamChunk(
+          writeStream, Uint8List.fromList(chunk));
+      transferredSize += chunk.length;
+      var percent = (transferredSize / archiveSize) * 100;
+      updateStatus(
+          AppLocalizations.of(context)!.tranferStatus("${percent.round()}"));
     }
+    await FileLayer.closeFileWriteStream(writeStream);
 
-    final jsonString = json.encode(jsonList);
-    final currTime = DateTime.now();
-    final exportedJsonName =
-        "daily_you_logs_${currTime.month}_${currTime.day}_${currTime.year}.json";
-    return await FileLayer.createFile(savePath, exportedJsonName,
-            Uint8List.fromList(utf8.encode(jsonString))) !=
-        null;
+    // Delete temp files
+    updateStatus(AppLocalizations.of(context)!.cleanUpStatus);
+    await File(join(tempDir.path, exportedZipName)).delete();
+
+    return true;
   }
 
-  Future<bool> importFromJson() async {
-    StatsProvider.instance.updateSyncStats(0, 0);
-    var selectedFile = await FileLayer.pickFile();
-    if (selectedFile == null) return false;
-    var bytes = await FileLayer.getFileBytes(selectedFile);
-    if (bytes == null) return false;
-    final jsonData = json.decode(utf8.decode(bytes.toList()));
+  Future<bool> restoreFromZip(
+      BuildContext context, void Function(String) updateStatus) async {
+    var importSuccessful = true;
 
-    final db = _database!;
+    String? archive = await FileLayer.pickFile(
+        allowedExtensions: ['zip'], mimeTypes: ['application/zip']);
 
-    for (var entry in jsonData) {
-      // Skip if the day already has an entry
-      if (await getEntryForDate(DateTime.parse(entry['timeCreated'])) == null) {
-        int id = await db.insert(entriesTable, {
-          'text': entry['text'],
-          'mood': entry['mood'],
-          'time_create': entry['timeCreated'],
-          'time_modified': entry['timeModified'],
-        });
-        // Support old imgPath field
-        if (entry['imgPath'] != null) {
-          EntryImage image = EntryImage(
-              entryId: id,
-              imgPath: entry['imgPath'],
-              imgRank: 0,
-              timeCreate: DateTime.now());
-          await addImg(image);
-        }
-        // Import images
-        if (entry['images'] != null) {
-          for (var img in entry['images']) {
-            await db.insert(imagesTable, {
-              EntryImageFields.entryId: id,
-              EntryImageFields.imgPath: img['imgPath'],
-              EntryImageFields.imgRank: img['imgRank'],
-              EntryImageFields.timeCreate: img['timeCreated'],
-            });
+    if (archive == null) return false;
+
+    var tempDir = await getTemporaryDirectory();
+
+    final tempZipName = "temp_backup.zip";
+
+    // Import archive
+    updateStatus(AppLocalizations.of(context)!.tranferStatus("0"));
+
+    final archiveSize = await FileLayer.getFileSize(archive);
+    if (archiveSize == null || archiveSize == 0) return false;
+
+    var readStream =
+        await FileLayer.readFileStream(archive, useExternalPath: true);
+    if (readStream == null) return false;
+    var writeStream = await FileLayer.openFileWriteStream(
+        tempDir.path, tempZipName,
+        useExternalPath: false);
+    if (writeStream == null) return false;
+
+    var transferredSize = 0;
+
+    await for (List<int> chunk in readStream) {
+      await FileLayer.writeFileWriteStreamChunk(
+          writeStream, Uint8List.fromList(chunk));
+      transferredSize += chunk.length;
+      var percent = (transferredSize / archiveSize) * 100;
+      updateStatus(
+          AppLocalizations.of(context)!.tranferStatus("${percent.round()}"));
+    }
+    await FileLayer.closeFileWriteStream(writeStream);
+
+    // Restore archive
+    final restoreFolder = Directory(join(tempDir.path, "Restore"));
+    if (await restoreFolder.exists() == false) {
+      await restoreFolder.create();
+    }
+
+    updateStatus(AppLocalizations.of(context)!.restoringBackupStatus("0"));
+
+    var rxPort = ReceivePort();
+
+    rxPort.listen((data) {
+      var percent = data as double;
+      updateStatus(AppLocalizations.of(context)!
+          .restoringBackupStatus("${percent.round()}"));
+    });
+
+    await compute(decodeArchive,
+        [join(tempDir.path, tempZipName), restoreFolder.path, rxPort.sendPort]);
+
+    rxPort.close();
+
+    final tempDb = File(join(restoreFolder.path, 'daily_you.db'));
+    if (await tempDb.exists()) {
+      // Import database
+      await _database!.close();
+      await File(await getInternalDbPath())
+          .writeAsBytes(await tempDb.readAsBytes());
+      await initDB();
+
+      // Import images. These will be garbage collected after import
+      if (await Directory(join(restoreFolder.path, "Images")).exists()) {
+        // Also show cleanup status here since images may take awhile
+        updateStatus(AppLocalizations.of(context)!.cleanUpStatus);
+        var files = Directory(join(restoreFolder.path, "Images")).list();
+        final internalImagePath = await getInternalImgDatabasePath();
+        await for (FileSystemEntity fileEntity in files) {
+          if (fileEntity is File) {
+            await File(join(internalImagePath, basename(fileEntity.path)))
+                .writeAsBytes(await fileEntity.readAsBytes());
           }
         }
+        if (usingExternalImg()) await syncImageFolder(false);
+        await garbageCollectImages();
+      }
+
+      await StatsProvider.instance.updateStats();
+    } else {
+      importSuccessful = false;
+    }
+
+    // Delete temp files
+    updateStatus(AppLocalizations.of(context)!.cleanUpStatus);
+    await File(join(tempDir.path, tempZipName)).delete();
+    if (await restoreFolder.exists()) {
+      await restoreFolder.delete(recursive: true);
+    }
+
+    return importSuccessful;
+  }
+
+  Future<void> encodeArchive(List<dynamic> args) async {
+    SendPort sendPort = args[3];
+    var encoder = ZipFileEncoder();
+    encoder.createWithStream(OutputFileStream(args[0]));
+    await encoder.addFile(File(args[1]));
+    await encoder.addDirectory(Directory(args[2]), onProgress: (progress) {
+      sendPort.send(progress * 100);
+    });
+    await encoder.close();
+  }
+
+  Future<void> decodeArchive(List<dynamic> args) async {
+    SendPort sendPort = args[2];
+    var decoder = ZipDecoder().decodeStream(InputFileStream(args[0]));
+
+    // Track number of files for progress indication
+    var totalFileCount = decoder.numberOfFiles();
+    var processedFileCount = 0;
+
+    for (final entry in decoder) {
+      if (entry.isFile) {
+        final bytes = entry.readBytes();
+        if (bytes == null) continue;
+        final parent = Directory(File(join(args[1], entry.name)).parent.path);
+        if (await parent.exists() == false) {
+          await parent.create(recursive: true);
+        }
+        await File(join(args[1], entry.name)).writeAsBytes(bytes);
+
+        // Updates status
+        processedFileCount += 1;
+        sendPort.send((processedFileCount / totalFileCount) * 100);
+      } else {
+        await Directory(join(args[1], entry.name)).create(recursive: true);
       }
     }
-    if (usingExternalImg()) await syncImageFolder(true);
-    StatsProvider.instance.updateStats();
-    return true;
   }
 }
